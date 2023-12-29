@@ -3,49 +3,24 @@ import requests
 import re
 import logging
 from error import PageNotFoundException, RateLimitException
-import threading
-import  concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 import time
 import warnings
-warnings.filterwarnings('ignore')
 import random
+import asyncio
+from decorators import retry_on_rate_limit_exception, tracer
 
-logging.basicConfig(filename='app.log', filemode='w',  level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-topic_file_path = "topic.txt"
-lock = threading.Lock()
-max_retries = 3
 
-# Decorator function for estimate the main function execution time
-def tracer(func):
-    def wrapper(*args):
-        logging.debug(f"{func.__name__} function")
-        before = time.time()
-        result  = func(*args)
-        logging.debug(f"Execution time: {time.time() - before} seconds")
-        return result
-    return wrapper
+warnings.filterwarnings('ignore')
+logging.basicConfig(filemode='w',  level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Decorator function for get_wikipedia_page function
-def retry_on_rate_limit_exception(func):
-    def wrapper(*args):
-        for attempt in range(max_retries): 
-            try:
-                result = func(*args)
-                return result
-            except RateLimitException:
-                logging.debug('rate limit handling')
-                retry_delay = random.randint(1,7)
-                logging.warning(f"Rate limit exceeded. Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                continue
-        logging.error(f"Could not retrieve page {args[0]}")
-    
-    return wrapper
+
+TOPIC_FILE_PATH = "topic.txt"
+
 
 # get topics file path, return topics list
 # possible errors: FileNotFoundError
-def read_file(file_path) -> list:
+def read_topic_file(file_path) -> list:
     topic_list = []
     try:    
         with open(file_path, 'r') as file:
@@ -124,42 +99,50 @@ def words_distribution_to_dict(topic: str) -> dict:
 
 # get df and topic, update the df using the word count dictionary
 # possible errors: page topic not found
-def word_distribution_task(df: pd.DataFrame, topic: str):
+async def word_distribution_task(df: pd.DataFrame, topic: str) -> None:
     try:    
         words_count_dict = words_distribution_to_dict(topic)
         logging.debug(f"create word dict for topic: {topic}")
     except PageNotFoundException as e:
         print(e)
         return
-    lock.acquire()
+    
     for word in words_count_dict.keys():
         if word not in df.columns:
             df[word] = None
         df.at[topic, word] = words_count_dict[word]
-    lock.release() 
+    
 
-@tracer
-def main():
+async def async_main():
     global  words_count_dict
-    topic_list = read_file(topic_file_path)
+    topic_list = read_topic_file(TOPIC_FILE_PATH)
     logging.debug(topic_list)
-    futures = []
-    max_threads = 3
+    tasks = []
+ 
     shared_data_frame = pd.DataFrame(index=topic_list)
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-            # Submit tasks to the pool
-            for topic in topic_list:    
-                future = executor.submit(word_distribution_task, shared_data_frame, topic)
-                logging.debug("future has created")
-                futures.append(future)
-                # Wait for all tasks to complete
-            concurrent.futures.wait(futures)
-            shared_data_frame.to_csv('word_distribution.csv', index=True)
-            print("Update word_distribution csv file")
+        # Submit tasks to the pool
+        for topic in topic_list:    
+            task = asyncio.create_task(word_distribution_task(shared_data_frame, topic))
+            logging.debug("future has created")
+            tasks.append(task)
+
+
+        print(f"===========> Task list:{tasks} \n Now waiting for all tasks to complete")
+
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+
+        shared_data_frame.to_csv('word_distribution.csv', index=True)
+        print("=====================> Update word_distribution csv file")
     except Exception as e:
         print(f"Unknown Error: {e}")
 
 
-if __name__ == "__main__":
-    main()
+
+@tracer
+def main():
+    asyncio.run(async_main())
+
+
+main()
